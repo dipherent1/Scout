@@ -37,7 +37,7 @@ function loadJson<T>(key: string, fallback: T): T {
 export const useScout = defineStore('scout', () => {
   // ---- Profile (stays in the browser) ----
   const bio = ref(localStorage.getItem(PROFILE_KEY) ?? '')
-  const onboardingOpen = ref(localStorage.getItem(PROFILE_KEY) === null)
+  const onboardingOpen = ref(false)
   watch(bio, (b) => localStorage.setItem(PROFILE_KEY, b))
   const bioVec = computed(() => (bio.value.trim() ? embed(bio.value) : null))
 

@@ -9,7 +9,6 @@ import SearchBar from './ui/SearchBar.vue'
 import TuningPanel from './ui/TuningPanel.vue'
 
 const store = useScout()
-const search = ref<InstanceType<typeof SearchBar>>()
 const panel = ref<'none' | 'tuning' | 'contacts'>('none')
 
 onMounted(() => {
@@ -19,10 +18,10 @@ onMounted(() => {
 
 <template>
   <main class="app">
-    <ScanView @search="(q) => search?.prefill(q)" />
+    <ScanView />
 
     <div class="topbar" @pointerdown.stop @pointerup.stop>
-      <SearchBar ref="search" />
+      <SearchBar />
       <button class="icon" title="Who to contact" @click="panel = 'contacts'">
         <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Zm2 4v2h10V8H7Zm0 4v2h10v-2H7Zm0 4v2h6v-2H7Z"/></svg>
         <span v-if="store.contactList.length" class="badge">{{ store.contactList.length }}</span>

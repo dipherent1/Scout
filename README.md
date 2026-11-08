@@ -27,7 +27,13 @@ If the phone can't connect:
 
 Tests: `cd web && npm test` and `cd api && uv run pytest`.
 
-## What to try
+## Real text (camera on)
+
+When the camera is on, Scout reads real text on the device with Tesseract.js (WASM) in sparse-text mode. It alternates global and local thresholding between frames, so it reads both light-on-dark banners and dark text on white paper. This stands in for the ONNX detector planned in step 2. The OCR engine and English model (a few MB) download from the jsDelivr CDN the first time, so the phone needs internet. Expect about 1 s per frame on a laptop and slower on a phone. It handles printed signs well and stylized logos poorly; for those, use the camera button, which sends a photo to Gemini.
+
+Names in the sample bundle lock on the device: Stripe, Notion, Ramp, Datadog, Cloudflare, Vercel, Figma, Databricks, Snowflake, MongoDB, Twilio, Supabase, Linear, Apple, Hugging Face. Text that matches nothing is never sent to the server on its own. **Press and hold** a box, or any spot on the screen (a logo, say), and Scout crops around it and sends the crop plus the words it read to Gemini. A quick tap only opens a company Scout already recognized. The bottom card says "Unknown" until something matches. Full history and decisions: [docs/PROJECT_LOG.md](docs/PROJECT_LOG.md). To go back to the simulated venue with the camera on, turn on "Simulated banners instead of real OCR" in the tuning panel.
+
+## What to try (simulated venue)
 
 Simulated banners are placed around you (turn left and right). Each one exercises a different path:
 

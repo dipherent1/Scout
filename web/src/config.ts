@@ -14,12 +14,13 @@ export interface Tuning {
   simInferenceMs: number
   simNoiseDeg: number
   simDropout: number
+  ocrMinConf: number
+  ocrMaxSide: number
   // Matching
   lockThreshold: number
   chipThreshold: number
   lockHits: number
   fallbackStableFrames: number
-  fallbackMinIntervalMs: number
   // Tracker / animation
   springStiffness: number
   springDamping: number
@@ -27,8 +28,8 @@ export interface Tuning {
   motionCompensation: boolean
   // UI
   dwellMs: number
-  showSimScene: boolean
-  showHud: boolean
+  /** Use the simulated venue even when the real camera is on (otherwise real OCR runs). */
+  simulateWithCamera: boolean
   haptics: boolean
   forceTapToScan: boolean
   greenThreshold: number
@@ -43,18 +44,18 @@ export const DEFAULT_TUNING: Tuning = {
   simInferenceMs: 70,
   simNoiseDeg: 0.35,
   simDropout: 0.1,
+  ocrMinConf: 60,
+  ocrMaxSide: 1024,
   lockThreshold: 0.85,
   chipThreshold: 0.6,
   lockHits: 2,
   fallbackStableFrames: 3,
-  fallbackMinIntervalMs: 2000,
   springStiffness: 220,
   springDamping: 26,
   maxMisses: 5,
   motionCompensation: true,
   dwellMs: 2000,
-  showSimScene: true,
-  showHud: true,
+  simulateWithCamera: false,
   haptics: true,
   forceTapToScan: false,
   greenThreshold: 0.2,

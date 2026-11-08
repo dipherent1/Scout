@@ -2,18 +2,18 @@
 import { computed, markRaw, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { FOV_H_DEG, tuning } from '../config'
 import { PoseSource } from '../camera/pose'
+import { liveStats as hud } from '../camera/stats'
 import { drawBooths, drawTrack, drawVenue, RELEVANCE_COLOR, trackPx } from '../camera/overlay'
 import { Tracker, type Track } from '../camera/tracker'
 import { captureJpeg, useCamera } from '../camera/useCamera'
 import type { View } from '../camera/projection'
 import { detectCapabilities, type Capabilities } from '../detect/capability'
 import { DetectorClient } from '../detect/detector'
-import { normalize } from '../match/normalize'
+import { OcrDetector } from '../detect/ocr'
 import { scan, type ScanCandidate } from '../services/api'
 import { useScout } from '../stores/scout'
-import type { Company, MatchResult, Pose } from '../types'
+import type { Company, DetectionResult, Pose } from '../types'
 
-const emit = defineEmits<{ search: [query: string] }>()
 const store = useScout()
 
 const root = ref<HTMLDivElement>()
@@ -27,26 +27,21 @@ const caps = ref<Capabilities | null>(null)
 const tapMode = computed(() => tuning.forceTapToScan || caps.value?.mode === 'tap')
 const hasCamera = computed(() => !!camera.stream.value)
 
-const hud = reactive({ fps: 0, detFps: 0, inferMs: 0, tracks: 0, paused: '' as string, lowPower: false })
-
-// Labels and chips rendered as DOM so they are tappable.
-interface Label {
-  id: number
-  x: number
-  y: number
-  w: number
-  state: Track['state']
-  company: Company | null
-  color: string
-  candidates: MatchResult[]
-  text: string
-}
-const labels = ref<Label[]>([])
+/**
+ * What the bottom hint card says while no company card is open. Boxes carry no
+ * text over the camera; this one card is the only status readout.
+ */
+const hint = reactive({ mode: 'unknown' as 'unknown' | 'reading' | 'candidate' | 'failed', name: '', trackId: -1 })
+let failedUntil = 0
+let pointBusy = false
 
 // Tap-to-scan / photo results
 const snap = reactive({ busy: false, candidates: [] as ScanCandidate[], message: '' })
 
-let detector: DetectorClient | null = null
+let simDetector: DetectorClient | null = null
+let ocrDetector: OcrDetector | null = null
+/** Real OCR when the camera is live, the simulated venue otherwise (or when forced in tuning). */
+const useRealOcr = computed(() => hasCamera.value && !tuning.simulateWithCamera)
 let tracker: Tracker | null = null
 let raf = 0
 let lastFrame = 0
@@ -60,8 +55,6 @@ let dpr = 1
 let currentPose: Pose = { yaw: 0, pitch: 0 }
 let focusedId: number | null = null
 let focusedSince = 0
-let lastFallbackAt = 0
-const sentFallbackKeys = new Set<string>()
 
 function view(): View {
   return { fovH: FOV_H_DEG, aspect: W / Math.max(1, H) }
@@ -82,7 +75,8 @@ function trackerParams() {
 
 watch(tuning, () => {
   if (tracker) tracker.params = trackerParams()
-  detector?.updateSettings({ inferenceMs: tuning.simInferenceMs, noiseDeg: tuning.simNoiseDeg, dropout: tuning.simDropout })
+  simDetector?.updateSettings({ inferenceMs: tuning.simInferenceMs, noiseDeg: tuning.simNoiseDeg, dropout: tuning.simDropout })
+  ocrDetector?.updateSettings({ minConf: tuning.ocrMinConf, maxSide: tuning.ocrMaxSide })
 })
 
 function resize() {
@@ -93,7 +87,7 @@ function resize() {
   H = el.clientHeight
   c.width = Math.round(W * dpr)
   c.height = Math.round(H * dpr)
-  detector?.updateSettings({ aspect: W / Math.max(1, H) })
+  simDetector?.updateSettings({ aspect: W / Math.max(1, H) })
 }
 
 function buzz(ms: number) {
@@ -109,9 +103,13 @@ async function start() {
   started.value = true
   caps.value = await detectCapabilities()
   // Both permissions must be requested from this tap (iOS requires a user gesture).
-  await Promise.all([camera.start(video.value!), pose.start(true)])
+  await Promise.all([hasCamera.value ? true : camera.start(video.value!), pose.start(true)])
   tracker = markRaw(new Tracker(store.matcher, trackerParams()))
-  detector = markRaw(
+  if (hasCamera.value) {
+    ocrDetector = markRaw(new OcrDetector({ minConf: tuning.ocrMinConf, maxSide: tuning.ocrMaxSide }))
+    ocrDetector.onResult = onDetections
+  }
+  simDetector = markRaw(
     new DetectorClient({
       inferenceMs: tuning.simInferenceMs,
       noiseDeg: tuning.simNoiseDeg,
@@ -120,14 +118,7 @@ async function start() {
       aspect: W / Math.max(1, H),
     }),
   )
-  detector.onResult = (r) => {
-    if (!tracker) return
-    detCount++
-    hud.inferMs = hud.inferMs * 0.8 + r.inferenceMs * 0.2
-    const ev = tracker.ingest(r, currentPose, view(), performance.now())
-    for (const t of ev.locked) onLock(t)
-    for (const t of ev.needsFallback) void serverFallback(t)
-  }
+  simDetector.onResult = onDetections
   if (hasCamera.value && 'requestVideoFrameCallback' in HTMLVideoElement.prototype) {
     const onVideoFrame = (now: number) => {
       maybeSubmit(now)
@@ -139,9 +130,18 @@ async function start() {
   raf = requestAnimationFrame(loop)
 }
 
+function onDetections(r: DetectionResult) {
+  if (!tracker) return
+  detCount++
+  hud.inferMs = hud.inferMs * 0.8 + r.inferenceMs * 0.2
+  const ev = tracker.ingest(r, currentPose, view(), performance.now())
+  for (const t of ev.locked) onLock(t)
+  // Text that matches nothing is never sent anywhere on its own; the user taps it to scan.
+}
+
 /** Frame scheduler: target fps, low-power mode after a quiet stretch, pause during fast motion. */
 function maybeSubmit(now: number) {
-  if (!detector || !tracker || tapMode.value) return
+  if (!simDetector || !tracker || tapMode.value) return
   hud.lowPower = now - tracker.lastHitAt > tuning.lowPowerAfterMs
   const fps = hud.lowPower ? tuning.lowPowerFps : tuning.detectFps
   if (now - lastSubmit < 1000 / fps) return
@@ -149,11 +149,21 @@ function maybeSubmit(now: number) {
     hud.paused = 'motion'
     return
   }
-  hud.paused = document.hidden ? 'hidden' : ''
-  if (document.hidden) return
-  // The simulated detector does not need pixels; the ONNX detector will receive
-  // an ImageBitmap of the video frame here (createImageBitmap(video)).
-  if (detector.submit(currentPose, now)) lastSubmit = now
+  if (document.hidden) {
+    hud.paused = 'hidden'
+    return
+  }
+  // A card covering the screen means the user is reading, not scanning: stop OCR to save battery.
+  if (store.sheet === 'half' || store.sheet === 'full') {
+    hud.paused = 'card open'
+    return
+  }
+  hud.paused = ''
+  const ok =
+    useRealOcr.value && ocrDetector
+      ? ocrDetector.submit(currentPose, now, video.value!, W, H)
+      : simDetector.submit(currentPose, now)
+  if (ok) lastSubmit = now
 }
 
 function onLock(t: Track) {
@@ -166,42 +176,88 @@ function onLock(t: Track) {
   if (store.sheet === 'hidden' || (store.sheet === 'peek' && t.id === focusedId)) store.select(c, 'scan', 'peek')
 }
 
-/** Text is visible and stable but matches nothing locally: ask the server (rate-limited, no repeats). */
-async function serverFallback(t: Track) {
-  const texts = [...new Set(t.texts.filter((s) => s.replace(/[^a-z0-9]/gi, '').length >= 3))]
-  const key = normalize(texts.join(' | '))
-  const now = performance.now()
-  if (!key || sentFallbackKeys.has(key) || now - lastFallbackAt < tuning.fallbackMinIntervalMs) {
-    t.fallbackRequested = false
-    t.stableNoMatch = 0
-    return
-  }
-  sentFallbackKeys.add(key)
-  lastFallbackAt = now
-  store.metrics.serverFallbacks++
-  t.state = 'reading'
-  console.info('[scout] server fallback', texts)
-  const res = await scan(texts)
+/** Turn a /scan answer into a company from the local list, or fetch it. */
+async function resolveScan(res: Awaited<ReturnType<typeof scan>>): Promise<{ company: Company; confidence: number } | null> {
   const top = res?.candidates[0]
-  if (!top || top.confidence < tuning.chipThreshold) {
-    // Readable text that is not a company (or the server is offline): keep the
-    // faint box, never ask again for it. Manual search stays in the top bar.
-    t.state = 'text'
-    return
-  }
+  if (!top || top.confidence < tuning.chipThreshold) return null
   let company = top.domain ? (store.companies.find((c) => c.domain === top.domain) ?? null) : null
   if (!company) company = await store.lookupOnline(top.domain || top.name)
-  if (!company) {
+  return company ? { company, confidence: top.confidence } : null
+}
+
+/**
+ * User tapped a detected box that matched nothing. Send the words read plus a
+ * padded crop of that box (so logos work too) to the server.
+ */
+async function scanTrack(t: Track) {
+  if (t.state === 'reading') return
+  buzz(10)
+  const texts = [...new Set(t.texts.filter((s) => s.replace(/[^a-z0-9]/gi, '').length >= 2))]
+  let jpeg: string | undefined
+  if (hasCamera.value && video.value) {
+    const p = trackPx(t, currentPose, view(), W, H)
+    jpeg = captureJpeg(video.value, 768, cropRegion(p.x, p.y, p.w, p.h, 0.25)) ?? undefined
+  }
+  store.metrics.serverFallbacks++
+  t.state = 'reading'
+  const hit = await resolveScan(await scan(texts, jpeg))
+  if (!hit) {
     t.state = 'unknown'
+    failedUntil = performance.now() + 3500
     return
   }
-  if (top.confidence >= tuning.lockThreshold) {
-    t.lockTo(company, performance.now())
+  if (hit.confidence >= tuning.lockThreshold) {
+    t.lockTo(hit.company, performance.now())
     onLock(t)
   } else {
     t.state = 'candidates'
-    t.candidates = [{ company, score: top.confidence }]
+    t.candidates = [{ company: hit.company, score: hit.confidence }]
   }
+}
+
+/** User tapped empty screen (a logo with no readable text): crop around the finger and send it. */
+async function scanPoint(x: number, y: number) {
+  if (pointBusy || !hasCamera.value || !video.value) return
+  pointBusy = true
+  buzz(10)
+  const w = W * 0.7
+  const h = Math.min(H * 0.35, w)
+  const jpeg = captureJpeg(video.value, 768, cropRegion(x - w / 2, y - h / 2, w, h, 0))
+  store.metrics.serverFallbacks++
+  const hit = jpeg ? await resolveScan(await scan([], jpeg)) : null
+  pointBusy = false
+  if (!hit) {
+    failedUntil = performance.now() + 3500
+    return
+  }
+  buzz(25)
+  store.prefetchIcebreaker(hit.company)
+  store.select(hit.company, 'chip', 'peek')
+}
+
+/** Screen rect (px, object-fit: cover), padded by a fraction on each side -> normalized video region. */
+function cropRegion(px: number, py: number, pw: number, ph: number, pad: number) {
+  const v = video.value!
+  const cover = Math.max(W / v.videoWidth, H / v.videoHeight)
+  const ox = (v.videoWidth - W / cover) / 2
+  const oy = (v.videoHeight - H / cover) / 2
+  const x0 = Math.max(0, ox + (px - pw * pad) / cover)
+  const y0 = Math.max(0, oy + (py - ph * pad) / cover)
+  return {
+    x: x0 / v.videoWidth,
+    y: y0 / v.videoHeight,
+    w: (pw * (1 + 2 * pad)) / cover / v.videoWidth,
+    h: (ph * (1 + 2 * pad)) / cover / v.videoHeight,
+  }
+}
+
+function openHint() {
+  const t = tracker?.tracks.find((x) => x.id === hint.trackId)
+  const m = t?.candidates[0]
+  if (!t || !m) return
+  t.lockTo(m.company, performance.now(), true)
+  buzz(15)
+  store.select(m.company, 'chip', 'half')
 }
 
 function loop(now: number) {
@@ -217,6 +273,9 @@ function loop(now: number) {
     hud.fps = Math.round((frames * 1000) / (now - statsAt))
     hud.detFps = Math.round((detCount * 1000) / (now - statsAt))
     hud.tracks = tracker?.tracks.length ?? 0
+    hud.cameraError = camera.error.value ?? ''
+    hud.sensor = pose.hasSensor ? 'gyro' : 'drag'
+    hud.detector = useRealOcr.value ? (ocrDetector?.backend ?? '') : 'simulated'
     frames = 0
     detCount = 0
     statsAt = now
@@ -231,7 +290,7 @@ function render(now: number) {
   ctx.clearRect(0, 0, W, H)
   const v = view()
   if (!hasCamera.value) drawVenue(ctx, currentPose, v, W, H)
-  if (tuning.showSimScene || !hasCamera.value) drawBooths(ctx, currentPose, v, W, H, hasCamera.value)
+  if (!useRealOcr.value) drawBooths(ctx, currentPose, v, W, H, hasCamera.value)
 
   // Focus = the locked box nearest the center; drives the dwell cue and which card is shown.
   let focus: Track | null = null
@@ -260,34 +319,59 @@ function render(now: number) {
     if (dwell >= 1) store.setSheet('half')
   }
 
-  const next: Label[] = []
+  let cand: Track | null = null
+  let candD = 0.5
+  let reading = pointBusy
   for (const t of tracker.tracks) {
     const p = pxById.get(t.id)!
-    const color = colorFor(t.company)
-    drawTrack(ctx, t, p, { now, color, dwell: t === focus ? dwell : null })
-    if (t.dying || t.opacity.x < 0.3 || t.state === 'text') continue
-    if (p.x > W || p.x + p.w < 0 || p.y > H || p.y + p.h < 0) continue
-    next.push({
-      id: t.id,
-      x: p.x - 6,
-      y: p.y + p.h + 10,
-      w: p.w,
-      state: t.state,
-      company: t.company,
-      color,
-      candidates: t.candidates,
-      text: t.lastText,
-    })
+    drawTrack(ctx, t, p, { now, color: colorFor(t.company), dwell: t === focus ? dwell : null })
+    if (t.dying) continue
+    if (t.state === 'reading') reading = true
+    if (t.state === 'candidates' && t.candidates.length) {
+      const d = Math.hypot((p.x + p.w / 2) / W - 0.5, (p.y + p.h / 2) / H - 0.45)
+      if (d < candD) {
+        candD = d
+        cand = t
+      }
+    }
   }
-  labels.value = next
+  const mode = reading ? 'reading' : cand ? 'candidate' : now < failedUntil ? 'failed' : 'unknown'
+  const name = cand ? cand.candidates[0].company.name : ''
+  const trackId = cand ? cand.id : -1
+  if (hint.mode !== mode) hint.mode = mode
+  if (hint.name !== name) hint.name = name
+  if (hint.trackId !== trackId) hint.trackId = trackId
 }
 
 // ---- Interaction ----
-let down: { x: number; y: number; moved: boolean } | null = null
+let down: { x: number; y: number; moved: boolean; held: boolean } | null = null
+
+const HOLD_MS = 450
+let holdTimer = 0
+/** Where a press is being held, for the progress ring. */
+const press = reactive({ on: false, x: 0, y: 0 })
+
+function cancelHold() {
+  clearTimeout(holdTimer)
+  press.on = false
+}
 
 function onPointerDown(e: PointerEvent) {
-  down = { x: e.clientX, y: e.clientY, moved: false }
+  down = { x: e.clientX, y: e.clientY, moved: false, held: false }
   ;(e.target as HTMLElement).setPointerCapture?.(e.pointerId)
+  const rect = root.value!.getBoundingClientRect()
+  const x = e.clientX - rect.left
+  const y = e.clientY - rect.top
+  press.x = x
+  press.y = y
+  press.on = true
+  clearTimeout(holdTimer)
+  holdTimer = window.setTimeout(() => {
+    if (!down || down.moved) return
+    down.held = true
+    press.on = false
+    holdScan(x, y)
+  }, HOLD_MS)
 }
 function onPointerMove(e: PointerEvent) {
   if (!down) return
@@ -295,27 +379,49 @@ function onPointerMove(e: PointerEvent) {
   const dy = e.clientY - down.y
   if (!down.moved && Math.hypot(dx, dy) < 6) return
   down.moved = true
+  cancelHold()
   const v = view()
   pose.addDrag((-dx / W) * v.fovH, (dy / H) * (v.fovH / v.aspect))
   down.x = e.clientX
   down.y = e.clientY
 }
+
+const near = (t: Track, x: number, y: number) => {
+  const p = trackPx(t, currentPose, view(), W, H)
+  return x >= p.x - 12 && x <= p.x + p.w + 12 && y >= p.y - 12 && y <= p.y + p.h + 12
+}
+
+/** Press and hold: crop around the box (or the finger) and send it to the server. */
+function holdScan(x: number, y: number) {
+  if (!tracker) return
+  const t = tracker.tracks.find((t) => !t.dying && t.state !== 'locked' && t.state !== 'reading' && near(t, x, y))
+  if (t) void scanTrack(t)
+  else if (tapMode.value && !hasCamera.value) tapScan()
+  else void scanPoint(x, y)
+}
+
+/** A quick tap only opens things Scout already recognized. */
 function onPointerUp(e: PointerEvent) {
-  const wasTap = down && !down.moved
+  cancelHold()
+  const wasTap = down && !down.moved && !down.held
   down = null
   if (!wasTap || !tracker) return
   const rect = root.value!.getBoundingClientRect()
   const x = e.clientX - rect.left
   const y = e.clientY - rect.top
   for (const t of tracker.tracks) {
-    if (t.state !== 'locked' || !t.company) continue
-    const p = trackPx(t, currentPose, view(), W, H)
-    if (x >= p.x - 12 && x <= p.x + p.w + 12 && y >= p.y - 12 && y <= p.y + p.h + 12) {
+    if (t.dying || !near(t, x, y)) continue
+    if (t.state === 'locked' && t.company) {
       store.select(t.company, 'scan', 'half')
       return
     }
+    if (t.state === 'candidates' && t.candidates[0]) {
+      t.lockTo(t.candidates[0].company, performance.now(), true)
+      buzz(15)
+      store.select(t.candidates[0].company, 'chip', 'half')
+      return
+    }
   }
-  if (tapMode.value) tapScan()
 }
 
 function onKey(e: KeyboardEvent) {
@@ -329,26 +435,11 @@ function onKey(e: KeyboardEvent) {
   e.preventDefault()
 }
 
-function pickCandidate(label: Label, m: MatchResult) {
-  const t = tracker?.tracks.find((x) => x.id === label.id)
-  t?.lockTo(m.company, performance.now(), true)
-  buzz(15)
-  store.select(m.company, 'chip', 'half')
-}
-
-function dismissCandidates(label: Label) {
-  const t = tracker?.tracks.find((x) => x.id === label.id)
-  if (t) {
-    t.state = 'unknown'
-    t.candidates = []
-  }
-}
-
 /** Tap-to-scan mode: run one detection on the current frame. */
 function tapScan() {
-  if (!detector) return
   buzz(10)
-  detector.submit(currentPose, performance.now())
+  if (useRealOcr.value && ocrDetector) ocrDetector.submit(currentPose, performance.now(), video.value!, W, H)
+  else simDetector?.submit(currentPose, performance.now())
 }
 
 /** Real photo -> POST /scan (Gemini vision). This is the path weak devices use, and it works on real booths today. */
@@ -386,12 +477,16 @@ onMounted(() => {
   resize()
   window.addEventListener('resize', resize)
   window.addEventListener('keydown', onKey)
+  // Show the live camera behind the start screen. Phones that need a gesture simply stay dark until the tap.
+  void camera.start(video.value!)
 })
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf)
+  clearTimeout(holdTimer)
   window.removeEventListener('resize', resize)
   window.removeEventListener('keydown', onKey)
-  detector?.dispose()
+  simDetector?.dispose()
+  ocrDetector?.dispose()
   camera.stop()
   pose.stop()
 })
@@ -407,50 +502,33 @@ defineExpose({ recenter })
     @pointermove="onPointerMove"
     @pointerup="onPointerUp"
     @pointercancel="onPointerUp"
+    @contextmenu.prevent
   >
     <video ref="video" class="feed" playsinline muted autoplay />
     <canvas ref="canvas" class="overlay" />
 
-    <div class="labels">
-      <div
-        v-for="l in labels"
-        :key="l.id"
-        class="label"
-        :style="{ transform: `translate(${l.x}px, ${l.y}px)` }"
-        @pointerdown.stop
-        @pointerup.stop
-      >
-        <button
-          v-if="l.state === 'locked' && l.company"
-          class="chip locked"
-          :style="{ '--c': l.color }"
-          @click="store.select(l.company, 'scan', 'half')"
-        >
-          <span class="dot" />{{ l.company.name }}
-        </button>
-        <template v-else-if="l.state === 'candidates'">
-          <span class="hint">Did you mean</span>
-          <button v-for="m in l.candidates" :key="m.company.domain" class="chip" @click="pickCandidate(l, m)">
-            {{ m.company.name }}
-          </button>
-          <button class="chip ghost" aria-label="None of these" @click="dismissCandidates(l)">✕</button>
-        </template>
-        <span v-else-if="l.state === 'reading'" class="chip reading">reading…</span>
-        <button v-else-if="l.state === 'unknown'" class="chip ghost" @click="emit('search', l.text)">
-          Not recognized · Search
-        </button>
+    <div v-if="press.on" class="ring" :style="{ left: press.x + 'px', top: press.y + 'px', animationDuration: HOLD_MS + 'ms' }" />
+
+    <div v-if="started && store.sheet === 'hidden'" class="hintcard" @pointerdown.stop @pointerup.stop>
+      <button v-if="hint.mode === 'candidate'" class="hint-main" @click="openHint">
+        <strong>{{ hint.name }}?</strong>
+        <small>Tap to open</small>
+      </button>
+      <div v-else-if="hint.mode === 'reading'" class="hint-main static">
+        <span class="spinner" /><strong>Reading…</strong>
+      </div>
+      <div v-else class="hint-main static">
+        <strong>{{ hint.mode === 'failed' ? 'Still unknown' : 'Unknown' }}</strong>
+        <small>{{ hint.mode === 'failed' ? 'Move closer and hold the name or logo again' : 'Press and hold the name or logo on the screen' }}</small>
       </div>
     </div>
 
-    <div v-if="!started" class="start">
+    <div v-if="!started" class="start" @pointerdown.stop @pointerup.stop @click="start">
       <div class="start-card">
-        <h1>Scout</h1>
-        <p>Point your phone at a booth banner. Scout recognizes the company and gets an icebreaker ready.</p>
-        <button class="primary" @click="start">Start scanning</button>
-        <p class="fine">
-          Prototype: a simulated detector reads simulated banners placed around you. Turn to look around, or drag on a
-          laptop. Photos you snap go to Google for text recognition and are not stored.
-        </p>
+        <svg class="finder" viewBox="0 0 80 80" width="84" height="84"><path fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" d="M8 28V12a4 4 0 0 1 4-4h16M52 8h16a4 4 0 0 1 4 4v16M72 52v16a4 4 0 0 1-4 4H52M28 72H12a4 4 0 0 1-4-4V52"/><circle cx="40" cy="40" r="4" fill="currentColor"/></svg>
+        <h1>Point. Scout does the rest.</h1>
+        <p>Aim at a booth banner. Tap anywhere to begin.</p>
+        <p class="fine">Text is read on your device. Photos you snap go to Google for text recognition and are not stored.</p>
       </div>
     </div>
 
@@ -476,16 +554,6 @@ defineExpose({ recenter })
       <button class="chip ghost" @click="snap.candidates = []; snap.message = ''">✕</button>
     </div>
 
-    <div v-if="started && tuning.showHud" class="hud">
-      <span>{{ hud.fps }} fps</span>
-      <span>det {{ hud.detFps }}/s · {{ Math.round(hud.inferMs) }} ms</span>
-      <span>{{ hud.tracks }} boxes</span>
-      <span>{{ caps?.backend }} · {{ tapMode ? 'tap' : 'live' }}</span>
-      <span v-if="hud.lowPower">low power</span>
-      <span v-if="hud.paused">paused: {{ hud.paused }}</span>
-      <span v-if="camera.error.value" class="warn">no camera: {{ camera.error.value }}</span>
-      <span>{{ pose.hasSensor ? 'gyro' : 'drag' }}</span>
-    </div>
   </div>
 </template>
 
@@ -580,8 +648,22 @@ defineExpose({ recenter })
   inset: 0;
   display: grid;
   place-items: center;
-  background: radial-gradient(circle at 50% 35%, #18212e, #0b0d10 70%);
+  background: linear-gradient(180deg, rgba(8, 11, 16, 0.2), rgba(8, 11, 16, 0.55));
   padding: 24px;
+  cursor: pointer;
+}
+.start-card {
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.6);
+}
+.finder {
+  color: #5eead4;
+  animation: breathe 2.4s ease-in-out infinite;
+}
+@keyframes breathe {
+  50% {
+    transform: scale(1.1);
+    opacity: 0.7;
+  }
 }
 .start-card {
   max-width: 340px;
@@ -589,9 +671,9 @@ defineExpose({ recenter })
   color: #e5e7eb;
 }
 .start-card h1 {
-  font: 800 40px system-ui, sans-serif;
-  letter-spacing: -0.03em;
-  margin: 0 0 8px;
+  font: 800 28px system-ui, sans-serif;
+  letter-spacing: -0.02em;
+  margin: 12px 0 8px;
   color: #5eead4;
 }
 .start-card p {
@@ -612,6 +694,66 @@ defineExpose({ recenter })
   color: #042f2e;
   font: 700 16px system-ui, sans-serif;
   cursor: pointer;
+}
+.ring {
+  position: absolute;
+  width: 64px;
+  height: 64px;
+  margin: -32px 0 0 -32px;
+  border-radius: 50%;
+  border: 3px solid #5eead4;
+  pointer-events: none;
+  z-index: 15;
+  animation: hold linear forwards;
+}
+@keyframes hold {
+  from {
+    transform: scale(1.6);
+    opacity: 0.2;
+  }
+  to {
+    transform: scale(0.8);
+    opacity: 1;
+  }
+}
+.hintcard {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(env(safe-area-inset-bottom) + 14px);
+  z-index: 20;
+}
+.hint-main {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px 18px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(17, 20, 26, 0.82);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: #f9fafb;
+  font: inherit;
+  text-align: left;
+}
+button.hint-main {
+  cursor: pointer;
+  border-color: rgba(94, 234, 212, 0.5);
+}
+.hint-main strong {
+  font: 700 17px system-ui, sans-serif;
+}
+.hint-main small {
+  color: #94a3b8;
+  font: 500 13px system-ui, sans-serif;
+  text-align: right;
+  min-width: 0;
+}
+.hint-main strong {
+  flex: none;
 }
 .controls {
   position: absolute;

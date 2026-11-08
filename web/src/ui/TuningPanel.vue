@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { resetTuning, tuning, type Tuning } from '../config'
+import { liveStats } from '../camera/stats'
 import { useScout } from '../stores/scout'
 
 defineEmits<{ close: [] }>()
@@ -25,8 +26,14 @@ const groups: { title: string; sliders: { key: NumKey; label: string; min: numbe
     sliders: [
       { key: 'lockThreshold', label: 'Lock score', min: 0.6, max: 1, step: 0.01 },
       { key: 'chipThreshold', label: 'Chip score', min: 0.3, max: 0.9, step: 0.01 },
-      { key: 'fallbackStableFrames', label: 'Stable frames before server', min: 1, max: 10, step: 1 },
-      { key: 'fallbackMinIntervalMs', label: 'Min ms between server calls', min: 500, max: 10000, step: 250 },
+      { key: 'fallbackStableFrames', label: 'Frames before "Text unknown"', min: 1, max: 10, step: 1 },
+    ],
+  },
+  {
+    title: 'Real OCR (camera)',
+    sliders: [
+      { key: 'ocrMinConf', label: 'Min word confidence', min: 20, max: 95, step: 1 },
+      { key: 'ocrMaxSide', label: 'OCR frame size (px)', min: 480, max: 1600, step: 32 },
     ],
   },
   {
@@ -51,10 +58,9 @@ const groups: { title: string; sliders: { key: NumKey; label: string; min: numbe
 
 const toggles: { key: BoolKey; label: string }[] = [
   { key: 'motionCompensation', label: 'Motion compensation (gyro)' },
-  { key: 'showSimScene', label: 'Draw simulated banners over camera' },
+  { key: 'simulateWithCamera', label: 'Simulated banners instead of real OCR' },
   { key: 'haptics', label: 'Haptics' },
   { key: 'forceTapToScan', label: 'Force tap-to-scan fallback' },
-  { key: 'showHud', label: 'Show HUD' },
 ]
 
 const m = computed(() => store.metrics)
@@ -95,6 +101,23 @@ function resetMetrics() {
       <button class="close" @click="$emit('close')">✕</button>
     </header>
     <div class="scroll">
+      <section>
+        <h3>Detection (live)</h3>
+        <dl>
+          <dt>Detector</dt>
+          <dd>{{ liveStats.detector || '—' }}</dd>
+          <dt>Frame rate / detections</dt>
+          <dd>{{ liveStats.fps }} fps / {{ liveStats.detFps }} per s</dd>
+          <dt>Inference</dt>
+          <dd>{{ Math.round(liveStats.inferMs) }} ms</dd>
+          <dt>Boxes</dt>
+          <dd>{{ liveStats.tracks }}</dd>
+          <dt>Status</dt>
+          <dd>{{ liveStats.paused ? 'paused: ' + liveStats.paused : liveStats.lowPower ? 'low power' : 'scanning' }}</dd>
+          <dt>Orientation / camera</dt>
+          <dd>{{ liveStats.sensor }}{{ liveStats.cameraError ? ' · no camera: ' + liveStats.cameraError : '' }}</dd>
+        </dl>
+      </section>
       <section v-for="g in groups" :key="g.title">
         <h3>{{ g.title }}</h3>
         <label v-for="s in g.sliders" :key="s.key" class="slider">
